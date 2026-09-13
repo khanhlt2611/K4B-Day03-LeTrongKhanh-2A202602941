@@ -6,6 +6,7 @@ Hỗ trợ Native Tool Calling và chuyển đổi linh hoạt qua biến môi t
 import os
 import sys
 import json
+import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 
@@ -35,22 +36,103 @@ class MockOfflineProvider(BaseLLMProvider):
         return f"[Mock Chatbot Response]: Xin chào! Tôi đã nhận được câu hỏi '{prompt}'. (Chế độ Chatbot không có Tool tra cứu dữ liệu thời gian thực)."
 
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
-        prompt_lower = prompt.lower()
-        
-        # Mô phỏng nhận diện intent gọi Tool
-        if "sv2026001" in prompt_lower and "đặt lịch" in prompt_lower:
+        original_prompt = prompt.split("\n\nLỊCH SỬ ACTION/OBSERVATION", 1)[0]
+        original_prompt = original_prompt.removeprefix("YÊU CẦU BAN ĐẦU:\n")
+        prompt_lower = original_prompt.lower()
+        student_match = re.search(r"\bSV\d+\b", original_prompt, re.IGNORECASE)
+        advisor_match = re.search(r"\bGV\d+\b", original_prompt, re.IGNORECASE)
+        student_id = student_match.group(0).upper() if student_match else ""
+
+        history = []
+        history_marker = "LỊCH SỬ ACTION/OBSERVATION ĐÃ THỰC HIỆN:\n"
+        if history_marker in prompt:
+            history_text = prompt.split(history_marker, 1)[1].split("\n\nHãy tiếp tục", 1)[0]
+            try:
+                history = json.loads(history_text)
+            except json.JSONDecodeError:
+                history = []
+
+        called_tools = {
+            item.get("action", {}).get("tool_name")
+            for item in history
+        }
+        last_observation = history[-1].get("observation", {}) if history else {}
+
+        if history and last_observation.get("status") != "SUCCESS":
+            return {
+                "type": "text",
+                "content": last_observation.get("message") or last_observation.get("error", "Không thể hoàn tất yêu cầu."),
+                "thought": "Tool báo lỗi kết thúc nên tôi phản hồi dựa trên Observation."
+            }
+
+        if "schedule_appointment" in called_tools:
+            return {
+                "type": "text",
+                "content": last_observation.get("message", "Đã hoàn tất đặt lịch."),
+                "thought": "Yêu cầu đặt lịch đã hoàn tất."
+            }
+
+        if "get_schedule" in called_tools and "đặt" in prompt_lower:
+            available_slot = next(
+                (
+                    slot.get("datetime")
+                    for slot in last_observation.get("slots", [])
+                    if slot.get("status") == "AVAILABLE"
+                ),
+                ""
+            )
             return {
                 "type": "tool_call",
                 "tool_name": "schedule_appointment",
-                "arguments": {"student_id": "SV2026001", "datetime_str": "14:00 15/09/2026", "advisor_name": "PGS.TS Nguyễn Văn A"},
-                "thought": "Người dùng yêu cầu đặt lịch hẹn tư vấn cho sinh viên SV2026001. Tôi sẽ gọi tool schedule_appointment."
+                "arguments": {
+                    "student_id": student_id,
+                    "datetime_str": available_slot,
+                    "advisor_name": last_observation.get("advisor_name", "")
+                },
+                "thought": "Đã tìm thấy khung giờ trống đầu tiên, tôi sẽ tiến hành đặt lịch."
             }
-        elif "sv2026001" in prompt_lower or "tra cứu" in prompt_lower:
+
+        if "academic_query" in called_tools and ("lịch" in prompt_lower or "đặt" in prompt_lower):
+            student_data = last_observation.get("data", {})
+            return {
+                "type": "tool_call",
+                "tool_name": "get_schedule",
+                "arguments": {"advisor_id": student_data.get("advisor_id", "")},
+                "thought": "Đã có mã cố vấn từ hồ sơ sinh viên, tôi sẽ kiểm tra lịch tư vấn."
+            }
+
+        if history:
+            return {
+                "type": "text",
+                "content": json.dumps(last_observation, ensure_ascii=False),
+                "thought": "Đã có đủ dữ liệu từ Tool để trả lời."
+            }
+
+        # Mô phỏng nhận diện intent gọi Tool ở bước đầu tiên
+        if student_id and "đặt lịch" in prompt_lower:
+            return {
+                "type": "tool_call",
+                "tool_name": "schedule_appointment",
+                "arguments": {
+                    "student_id": student_id,
+                    "datetime_str": "14:00 15/09/2026",
+                    "advisor_name": "PGS.TS Nguyễn Văn A"
+                },
+                "thought": f"Người dùng yêu cầu đặt lịch cho {student_id}. Tôi sẽ gọi schedule_appointment."
+            }
+        elif advisor_match and "lịch" in prompt_lower:
+            return {
+                "type": "tool_call",
+                "tool_name": "get_schedule",
+                "arguments": {"advisor_id": advisor_match.group(0).upper()},
+                "thought": "Người dùng muốn kiểm tra lịch của cố vấn."
+            }
+        elif student_id or "tra cứu" in prompt_lower:
             return {
                 "type": "tool_call",
                 "tool_name": "academic_query",
-                "arguments": {"student_id": "SV2026001"},
-                "thought": "Người dùng muốn tra cứu thông tin học vụ của sinh viên SV2026001. Tôi sẽ gọi tool academic_query."
+                "arguments": {"student_id": student_id},
+                "thought": f"Người dùng muốn tra cứu thông tin học vụ của {student_id}. Tôi sẽ gọi academic_query."
             }
         else:
             return {

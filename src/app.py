@@ -5,6 +5,7 @@ Thực thi so sánh giữa Chatbot Baseline (Cấp 2) và ReAct Agent kết nố
 
 import json
 import os
+import re
 import sys
 import time
 from dotenv import load_dotenv
@@ -68,25 +69,83 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
     """
     print(f"\n🤖 [REACT AGENT] Câu hỏi: {user_query}")
     
+    def format_observation(tool_name: str, observation: dict) -> str:
+        """Tạo câu trả lời dự phòng từ dữ liệu thật, không để Agent tự bịa dữ liệu."""
+        status = observation.get("status")
+        if status == "SUCCESS" and tool_name == "academic_query":
+            student = observation.get("data", {})
+            return (
+                f"Kết quả tra cứu cho sinh viên {observation.get('student_id', '')} "
+                f"({student.get('full_name', '')}): Lớp {student.get('class', '')}, "
+                f"GPA: {student.get('gpa', '')}, Email: {student.get('email', '')}, "
+                f"Trạng thái: {student.get('status', '')}, "
+                f"Cố vấn: {student.get('advisor', '')} ({student.get('advisor_id', '')})."
+            )
+        if status == "SUCCESS" and tool_name == "get_schedule":
+            slots = observation.get("slots", [])
+            slot_summary = ", ".join(
+                f"{slot.get('datetime', '')} "
+                f"({'còn trống' if slot.get('status') == 'AVAILABLE' else 'đã được đặt'})"
+                for slot in slots
+            ) or "không có khung giờ nào"
+            return (
+                f"Lịch tư vấn của {observation.get('advisor_name', '')} "
+                f"({observation.get('advisor_id', '')}): {slot_summary}."
+            )
+        if status == "SUCCESS" and tool_name == "schedule_appointment":
+            return observation.get(
+                "message",
+                f"Đặt lịch thành công. Mã lịch hẹn: {observation.get('booking_id', '')}."
+            )
+        if status in {"NOT_FOUND", "SLOT_UNAVAILABLE"}:
+            return observation.get("message", "Không tìm thấy dữ liệu phù hợp.")
+        if status in {"EXECUTION_ERROR", "UNKNOWN_TOOL"}:
+            return observation.get("error", "Không thể thực thi công cụ.")
+        return observation.get(
+            "message",
+            f"Phản hồi từ công cụ: {json.dumps(observation, ensure_ascii=False)}"
+        )
+
     step = 0
     trace_logs = []
     tools_list = mcp_server.list_tools()
-    
+    react_history = []
+    executed_calls = set()
+    last_answer = ""
+    known_student = {}
+    known_schedule = {}
+    student_ids = list(dict.fromkeys(re.findall(r"\bSV\d+\b", user_query.upper())))
+    advisor_ids = list(dict.fromkeys(re.findall(r"\bGV\d+\b", user_query.upper())))
+
     while step < MAX_ITERATIONS:
         step += 1
         step_start_time = time.time()
         print(f"\n--- 🔄 Vòng lặp ReAct Loop (Step {step}/{MAX_ITERATIONS}) ---")
-        
-        # Gọi LLM với Native Tool Calling Specs
-        llm_response = provider.generate_with_tools(user_query, tools_list, system_prompt=REACT_AGENT_SYSTEM_PROMPT)
+
+        agent_input = user_query
+        if react_history:
+            agent_input = (
+                f"YÊU CẦU BAN ĐẦU:\n{user_query}\n\n"
+                "LỊCH SỬ ACTION/OBSERVATION ĐÃ THỰC HIỆN:\n"
+                f"{json.dumps(react_history, ensure_ascii=False, indent=2)}\n\n"
+                "Hãy tiếp tục xử lý yêu cầu ban đầu. Không gọi lại một Action đã có cùng "
+                "tham số. Nếu còn bước chưa hoàn thành thì gọi Tool kế tiếp; chỉ trả lời bằng "
+                "văn bản khi toàn bộ yêu cầu đã hoàn tất hoặc Observation báo lỗi kết thúc."
+            )
+
+        llm_response = provider.generate_with_tools(
+            agent_input,
+            tools_list,
+            system_prompt=REACT_AGENT_SYSTEM_PROMPT
+        )
         latency_ms = round((time.time() - step_start_time) * 1000, 2)
-        
+
         thought = llm_response.get("thought", "Đang suy luận...")
         print(f"🧠 [Thought]: {thought}")
-        
+
         # Trường hợp 1: LLM quyết định trả lời bằng văn bản trực tiếp
         if llm_response.get("type") == "text":
-            final_content = llm_response.get("content", "")
+            final_content = llm_response.get("content", "").strip() or last_answer
             print(f"🏁 [Final Answer]: {final_content}")
             trace_logs.append({
                 "step": step,
@@ -97,44 +156,79 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
                 "latency_ms": latency_ms
             })
             break
-            
+
         # Trường hợp 2: LLM đề xuất gọi Tool (Action)
         elif llm_response.get("type") == "tool_call":
             tool_name = llm_response.get("tool_name")
             arguments = llm_response.get("arguments", {})
-            
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            # Các mã được người dùng ghi rõ luôn có độ ưu tiên cao hơn ví dụ do LLM tự điền.
+            if tool_name in {"academic_query", "schedule_appointment"} and len(student_ids) == 1:
+                arguments["student_id"] = student_ids[0]
+            if tool_name == "get_schedule":
+                if len(advisor_ids) == 1:
+                    arguments["advisor_id"] = advisor_ids[0]
+                elif known_student.get("advisor_id"):
+                    arguments["advisor_id"] = known_student["advisor_id"]
+            if tool_name == "schedule_appointment":
+                if known_student.get("advisor"):
+                    arguments["advisor_name"] = known_student["advisor"]
+                if known_schedule:
+                    first_available = next(
+                        (
+                            slot.get("datetime")
+                            for slot in known_schedule.get("slots", [])
+                            if slot.get("status") == "AVAILABLE"
+                        ),
+                        None
+                    )
+                    if first_available and "khung giờ còn trống đầu tiên" in user_query.lower():
+                        arguments["datetime_str"] = first_available
+
+            call_signature = (
+                tool_name,
+                json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+            )
+            if call_signature in executed_calls:
+                final_content = last_answer or "Không thể tiếp tục vì Agent lặp lại cùng một Tool Call."
+                print("⚠️ [ReAct Guard]: Bỏ qua Tool Call trùng lặp.")
+                print(f"🏁 [Final Answer]: {final_content}")
+                trace_logs.append({
+                    "step": step,
+                    "query": user_query,
+                    "action_type": "FINAL_ANSWER",
+                    "thought": "Dừng vòng lặp vì Tool Call bị lặp.",
+                    "output": final_content,
+                    "latency_ms": latency_ms
+                })
+                break
+
             print(f"🛠️ [Action Proposed]: {tool_name}({arguments})")
-            
+
             # Thực thi Tool qua MCP Server
             mcp_result = mcp_server.call_tool(tool_name, arguments)
             obs_data = mcp_result.get("result", {})
-            
+            latency_ms = round((time.time() - step_start_time) * 1000, 2)
+
             if not obs_data:
-                print(f"👁️ [Observation từ MCP Server]: {{}}")
-                print(f"⚠️ [CHÚ Ý]: MCP Server trả về kết quả rỗng! Học viên cần hoàn thành TODO 2.1 trong 'src/mcp_server.py'.")
-                final_answer = "Chưa thể trả lời chi tiết do chưa nhận được dữ liệu từ MCP Server (hãy hoàn thành TODO 2.1)."
+                obs_data = {
+                    "status": "EMPTY_RESULT",
+                    "message": "MCP Server không trả về dữ liệu."
+                }
+                print("👁️ [Observation từ MCP Server]: {}")
             else:
                 obs_str = json.dumps(obs_data, ensure_ascii=False)
                 print(f"👁️ [Observation từ MCP Server]: {obs_str}")
-                
-                # Tổng hợp Final Answer từ kết quả Observation thực tế
-                if obs_data.get("status") == "SUCCESS":
-                    if "data" in obs_data:
-                        d = obs_data["data"]
-                        final_answer = (
-                            f"Kết quả tra cứu cho sinh viên {obs_data.get('student_id', '')} ({d.get('full_name', '')}): "
-                            f"Lớp {d.get('class', '')}, GPA: {d.get('gpa', '')}, Email: {d.get('email', '')}, "
-                            f"Trạng thái: {d.get('status', '')}, Cố vấn: {d.get('advisor', '')}."
-                        )
-                    elif "message" in obs_data:
-                        final_answer = obs_data["message"]
-                    else:
-                        final_answer = f"Đã hoàn tất xử lý qua MCP Server: {json.dumps(obs_data, ensure_ascii=False)}"
-                elif obs_data.get("status") == "NOT_FOUND":
-                    final_answer = obs_data.get("message", "Không tìm thấy thông tin sinh viên yêu cầu.")
-                else:
-                    final_answer = f"Phản hồi từ công cụ: {json.dumps(obs_data, ensure_ascii=False)}"
-            
+
+            executed_calls.add(call_signature)
+            last_answer = format_observation(tool_name, obs_data)
+            if tool_name == "academic_query" and obs_data.get("status") == "SUCCESS":
+                known_student = obs_data.get("data", {})
+            elif tool_name == "get_schedule" and obs_data.get("status") == "SUCCESS":
+                known_schedule = obs_data
+
             trace_logs.append({
                 "step": step,
                 "query": user_query,
@@ -144,20 +238,37 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
                 "observation": obs_data,
                 "latency_ms": latency_ms
             })
-            
-            # Kết thúc vòng lặp sau khi hoàn tất Observation và xuất Final Answer
-            print(f"🧠 [Thought]: Đã nhận được dữ liệu từ MCP Server. Tổng hợp kết quả phản hồi.")
-            print(f"🏁 [Final Answer]: {final_answer}")
-            
+
+            react_history.append({
+                "step": step,
+                "action": {"tool_name": tool_name, "arguments": arguments},
+                "observation": obs_data
+            })
+
+        else:
+            final_content = last_answer or "LLM trả về định dạng phản hồi không hợp lệ."
+            print(f"🏁 [Final Answer]: {final_content}")
             trace_logs.append({
-                "step": step + 1,
+                "step": step,
                 "query": user_query,
                 "action_type": "FINAL_ANSWER",
-                "thought": "Tổng hợp kết quả từ MCP Server thành công.",
-                "output": final_answer,
-                "latency_ms": 10.0
+                "thought": "Không nhận diện được kiểu phản hồi của LLM.",
+                "output": final_content,
+                "latency_ms": latency_ms
             })
             break
+
+    if trace_logs and trace_logs[-1].get("action_type") != "FINAL_ANSWER":
+        final_content = last_answer or "Agent đã đạt giới hạn số vòng lặp mà chưa hoàn tất yêu cầu."
+        print(f"🏁 [Final Answer]: {final_content}")
+        trace_logs.append({
+            "step": step + 1,
+            "query": user_query,
+            "action_type": "FINAL_ANSWER",
+            "thought": "Đã đạt giới hạn vòng lặp ReAct.",
+            "output": final_content,
+            "latency_ms": 0.0
+        })
 
     return trace_logs
 
